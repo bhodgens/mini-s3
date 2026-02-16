@@ -1,7 +1,8 @@
 package main
 
 import (
-	"bytes" // Added for getPayloadHash body handling
+	"bufio"
+	"bytes"
 	"crypto/hmac"
 	"crypto/md5"
 	"crypto/sha256"
@@ -15,8 +16,9 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp" // Added for parsing Authorization header
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -33,12 +35,71 @@ const (
 )
 
 // Credentials store (simple hardcoded version)
+// TODO: Load from environment variables or config file
 var serverCredentials = struct {
 	AccessKeyID     string
 	SecretAccessKey string
 }{
-	AccessKeyID:     "YOUR_ACCESS_KEY_ID",     // Replace with your desired Access Key ID
-	SecretAccessKey: "YOUR_SECRET_ACCESS_KEY", // Replace with your desired Secret Access Key
+	AccessKeyID:     getEnvOrDefault("MINIS3_ACCESS_KEY", "minioadmin"),
+	SecretAccessKey: getEnvOrDefault("MINIS3_SECRET_KEY", "minioadmin"),
+}
+
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+// decodeAWSChunked decodes aws-chunked Content-Encoding used by AWS CLI v2.
+// Format: <hex-size>;chunk-signature=...\r\n<data>\r\n, ending with 0\r\n<trailers>\r\n\r\n
+func decodeAWSChunked(body []byte) ([]byte, error) {
+	var result bytes.Buffer
+	reader := bufio.NewReader(bytes.NewReader(body))
+
+	for {
+		// Read the chunk header line
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("error reading chunk header: %w", err)
+		}
+
+		// Parse chunk size (format: "<hex>;chunk-signature=..." or just "<hex>")
+		line = strings.TrimSpace(line)
+		parts := strings.SplitN(line, ";", 2)
+		sizeStr := strings.TrimSpace(parts[0])
+
+		if sizeStr == "" {
+			continue // Skip empty lines
+		}
+
+		chunkSize, err := strconv.ParseInt(sizeStr, 16, 64)
+		if err != nil {
+			// Might be a trailer line, skip it
+			continue
+		}
+
+		if chunkSize == 0 {
+			// Final chunk - read remaining trailers
+			break
+		}
+
+		// Read the chunk data
+		chunkData := make([]byte, chunkSize)
+		n, err := io.ReadFull(reader, chunkData)
+		if err != nil && err != io.EOF {
+			return nil, fmt.Errorf("error reading chunk data: %w", err)
+		}
+		result.Write(chunkData[:n])
+
+		// Read the trailing \r\n after chunk data
+		reader.ReadString('\n')
+	}
+
+	return result.Bytes(), nil
 }
 
 // Regex for parsing the AWS V4 Authorization header
@@ -46,9 +107,6 @@ var authHeaderRegex = regexp.MustCompile(
 	`^AWS4-HMAC-SHA256 Credential=([^/]+)/([^/]+)/([^/]+)/s3/aws4_request, SignedHeaders=([^,]+), Signature=(.+)$`,
 )
 
-const (
-// ... existing constants ...
-)
 
 // S3Error defines the structure for S3 compatible XML error responses
 type S3Error struct {
@@ -355,48 +413,57 @@ func listBucketsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func createBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := dataDir + bucketName
-	metadataPath := bucketPath + "/.metadata" // Hidden subdirectory for metadata
+	// Validate bucket name
+	if err := validateBucketName(bucketName); err != nil {
+		log.Printf("Invalid bucket name %s: %v", bucketName, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidBucketName", err.Error())))
+		return
+	}
+
+	bucketPath := filepath.Join(dataDir, bucketName)
+	metadataPath := filepath.Join(bucketPath, ".metadata")
 
 	// Check if bucket already exists
 	if _, err := os.Stat(bucketPath); !os.IsNotExist(err) {
-		// Bucket exists, S3 PUT Bucket is idempotent, so 200 OK is fine.
-		// Optionally, check ownership or handle "BucketAlreadyOwnedByYou" if implementing users.
 		log.Printf("Bucket %s already exists.", bucketName)
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusOK) // S3 PUT Bucket is idempotent
 		return
 	}
 
 	// Create bucket directory
 	if err := os.Mkdir(bucketPath, 0755); err != nil {
 		log.Printf("Error creating bucket directory %s: %v", bucketPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating bucket.")))
 		return
 	}
 
 	// Create .metadata directory within the bucket
 	if err := os.Mkdir(metadataPath, 0755); err != nil {
 		log.Printf("Error creating metadata directory %s for bucket %s: %v", metadataPath, bucketName, err)
-		// Attempt to clean up by removing the bucket directory if metadata creation fails
 		os.RemoveAll(bucketPath)
-		http.Error(w, "Internal Server Error creating metadata store", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating bucket metadata storage.")))
 		return
 	}
 
-	log.Printf("Successfully created bucket: %s with metadata dir: %s", bucketName, metadataPath)
-	w.WriteHeader(http.StatusOK) // S3 spec: 200 OK for successful bucket creation
+	log.Printf("Successfully created bucket: %s", bucketName)
+	w.WriteHeader(http.StatusOK)
 }
 func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := dataDir + bucketName
-	metadataPath := bucketPath + "/.metadata"
+	bucketPath := filepath.Join(dataDir, bucketName)
+	metadataPath := filepath.Join(bucketPath, ".metadata")
 
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Attempted to delete non-existent bucket: %s", bucketName)
-		// S3 behavior for deleting a non-existent bucket can vary.
-		// Some might return 204 No Content, others 404 Not Found.
-		// Let's go with 404 for clarity that it wasn't there to begin with.
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
 		return
 	}
 
@@ -404,15 +471,18 @@ func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	files, err := os.ReadDir(bucketPath)
 	if err != nil {
 		log.Printf("Error reading bucket directory %s during delete: %v", bucketPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading bucket.")))
 		return
 	}
 
 	for _, file := range files {
 		if file.Name() != ".metadata" {
-			// If there's anything other than .metadata, the bucket is not empty.
 			log.Printf("Attempted to delete non-empty bucket: %s", bucketName)
-			http.Error(w, "BucketNotEmpty", http.StatusConflict) // S3 error code for non-empty bucket
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusConflict)
+			w.Write([]byte(errorToXML("BucketNotEmpty", "The bucket you tried to delete is not empty.")))
 			return
 		}
 	}
@@ -420,37 +490,43 @@ func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	// Delete .metadata directory first
 	if err := os.RemoveAll(metadataPath); err != nil {
 		log.Printf("Error deleting metadata directory %s for bucket %s: %v", metadataPath, bucketName, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error deleting bucket.")))
 		return
 	}
 
 	// Delete bucket directory
 	if err := os.RemoveAll(bucketPath); err != nil {
 		log.Printf("Error deleting bucket directory %s: %v", bucketPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error deleting bucket.")))
 		return
 	}
 
 	log.Printf("Successfully deleted bucket: %s", bucketName)
-	w.WriteHeader(http.StatusNoContent) // S3 spec: 204 No Content for successful bucket deletion
+	w.WriteHeader(http.StatusNoContent)
 }
 func getBucketLocationHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
 	bucketPath := filepath.Join(dataDir, bucketName)
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for GetBucketLocation", bucketName)
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
 		return
 	}
 
 	// S3 returns an empty LocationConstraint for US Standard (us-east-1)
-	// or the region string. We can hardcode a default or leave it empty.
-	// For simplicity, let's return an empty string, implying a default region.
-	location := LocationConstraint{Location: ""} // Or a specific region string e.g., "us-west-1"
+	location := LocationConstraint{Location: ""}
 	x, err := xml.MarshalIndent(location, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling LocationConstraint to XML for bucket %s: %v", bucketName, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error formatting response.")))
 		return
 	}
 
@@ -466,75 +542,109 @@ func headBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for HeadBucket", bucketName)
-		// S3 behavior for HEAD on a non-existent bucket is 404 Not Found.
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	// Bucket exists
 	w.WriteHeader(http.StatusOK)
 	log.Printf("Successfully served HeadBucket for %s", bucketName)
 }
 
 func putObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
 	bucketPath := filepath.Join(dataDir, bucketName)
+	// Object data is stored directly in the bucket directory
+	objectDataPath := filepath.Join(bucketPath, objectName)
+	// Metadata is stored in .metadata subdirectory
 	objectMetadataDir := filepath.Join(bucketPath, ".metadata")
 	objectMetadataPath := filepath.Join(objectMetadataDir, objectName+".meta")
+
+	// Validate object key
+	if err := validateObjectKey(objectName); err != nil {
+		log.Printf("Invalid object key %s: %v", objectName, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidArgument", err.Error())))
+		return
+	}
 
 	// Ensure bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for PutObject", bucketName)
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
 		return
 	}
 
-	// Ensure .metadata directory exists within the bucket
-	if _, err := os.Stat(objectMetadataDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(objectMetadataDir, 0755); err != nil {
-			log.Printf("Failed to create metadata directory %s: %v", objectMetadataDir, err)
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-			return
-		}
-	}
-
-	// Create/overwrite the object file
-	// For simplicity, we read the whole object into memory first to calculate MD5.
-	// For large files, streaming with tee to both file and hash would be better.
+	// Read the request body
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("Error reading request body for %s/%s: %v", bucketName, objectName, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading request body.")))
 		return
 	}
 	defer r.Body.Close()
+
+	// Handle aws-chunked Content-Encoding (used by AWS CLI v2)
+	contentEncoding := r.Header.Get("Content-Encoding")
+	if strings.Contains(contentEncoding, "aws-chunked") {
+		decodedBody, err := decodeAWSChunked(body)
+		if err != nil {
+			log.Printf("Error decoding aws-chunked body for %s/%s: %v", bucketName, objectName, err)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errorToXML("InvalidArgument", "Failed to decode chunked body.")))
+			return
+		}
+		body = decodedBody
+		log.Printf("Decoded aws-chunked body: %d bytes", len(body))
+	}
 
 	// Calculate ETag (MD5 hash of the content)
 	hash := md5.Sum(body)
 	eTag := hex.EncodeToString(hash[:])
 
-	// Create parent directories for the object if they don't exist
-	objectParentDir := filepath.Dir(objectMetadataPath)
-	if err := os.MkdirAll(objectParentDir, 0755); err != nil {
-		log.Printf("Error creating parent directories for object %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	// Create parent directories for the object data if they don't exist
+	objectDataParentDir := filepath.Dir(objectDataPath)
+	if err := os.MkdirAll(objectDataParentDir, 0755); err != nil {
+		log.Printf("Error creating parent directories for object data %s: %v", objectDataPath, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating object storage.")))
 		return
 	}
 
 	// Write the object data
-	if err := os.WriteFile(objectMetadataPath, body, 0644); err != nil {
-		log.Printf("Error writing object data to %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+	if err := os.WriteFile(objectDataPath, body, 0644); err != nil {
+		log.Printf("Error writing object data to %s: %v", objectDataPath, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error writing object data.")))
 		return
 	}
 
-	// Store metadata
+	// Create parent directories for the metadata file if they don't exist
+	metadataParentDir := filepath.Dir(objectMetadataPath)
+	if err := os.MkdirAll(metadataParentDir, 0755); err != nil {
+		log.Printf("Error creating parent directories for metadata %s: %v", objectMetadataPath, err)
+		// Clean up the object data file since metadata creation failed
+		os.Remove(objectDataPath)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating metadata storage.")))
+		return
+	}
+
+	// Store metadata - use actual body length, not Content-Length header
 	meta := ObjectMetadata{
 		ContentType:    r.Header.Get("Content-Type"),
-		ContentLength:  r.ContentLength, // This comes from the request header
+		ContentLength:  int64(len(body)), // Use actual body length
 		ETag:           eTag,
 		CustomMetadata: make(map[string]string),
 		LastModified:   time.Now().UTC(),
-		StoragePath:    objectMetadataPath, // Storing for potential future use, not strictly S3
+		StoragePath:    objectDataPath, // Points to actual object data
 	}
 
 	for headerName, headerValues := range r.Header {
@@ -546,28 +656,19 @@ func putObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	metaJSON, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling metadata for %s/%s: %v", bucketName, objectName, err)
-		// Object is written, but metadata failed. This is a partial failure state.
-		// For simplicity, we'll still return success to the client but log the error.
-		// A more robust system might try to clean up the object or retry metadata.
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", eTag)) // S3 ETag is usually quoted
-		w.WriteHeader(http.StatusOK)
-		return
-	}
-
-	// Create parent directories for the metadata file if they don't exist
-	// (e.g. if objectName includes slashes like "folder/object.txt")
-	metadataParentDir := filepath.Dir(objectMetadataPath)
-	if err := os.MkdirAll(metadataParentDir, 0755); err != nil {
-		log.Printf("Error creating parent directories for metadata %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		os.Remove(objectDataPath) // Clean up object data
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating metadata.")))
 		return
 	}
 
 	if err := os.WriteFile(objectMetadataPath, metaJSON, 0644); err != nil {
 		log.Printf("Error writing metadata file %s: %v", objectMetadataPath, err)
-		// Similar to above, object is written, but metadata failed.
-		w.Header().Set("ETag", fmt.Sprintf("\"%s\"", eTag))
-		w.WriteHeader(http.StatusOK)
+		os.Remove(objectDataPath) // Clean up object data
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error writing metadata.")))
 		return
 	}
 
@@ -583,7 +684,9 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for GetObject", bucketName)
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
 		return
 	}
 
@@ -591,34 +694,42 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	metaJSON, err := os.ReadFile(objectMetadataPath)
 	if os.IsNotExist(err) {
 		log.Printf("Object metadata %s not found for %s/%s", objectMetadataPath, bucketName, objectName)
-		http.Error(w, "NoSuchKey", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchKey", "The specified key does not exist.")))
 		return
 	}
 	if err != nil {
 		log.Printf("Error reading metadata file %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading object metadata.")))
 		return
 	}
 
 	var meta ObjectMetadata
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
 		log.Printf("Error unmarshalling metadata from %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error parsing object metadata.")))
 		return
 	}
 
-	// Check if actual object data file exists (as per metadata)
-	// This is an important check if StoragePath in metadata is the source of truth
-	actualObjectDataPath := meta.StoragePath
-	if _, err := os.Stat(actualObjectDataPath); os.IsNotExist(err) {
-		log.Printf("Object data file %s (from metadata) not found for %s/%s", actualObjectDataPath, bucketName, objectName)
-		// This case might indicate an inconsistency, perhaps the object was deleted manually
-		http.Error(w, "NoSuchKey", http.StatusNotFound)
+	// Check if actual object data file exists
+	objectDataPath := meta.StoragePath
+	if _, err := os.Stat(objectDataPath); os.IsNotExist(err) {
+		log.Printf("Object data file %s not found for %s/%s", objectDataPath, bucketName, objectName)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchKey", "The specified key does not exist.")))
 		return
 	}
 
 	// Set headers from metadata
-	w.Header().Set("Content-Type", meta.ContentType)
+	if meta.ContentType != "" {
+		w.Header().Set("Content-Type", meta.ContentType)
+	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.ContentLength))
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", meta.ETag))
 	w.Header().Set("Last-Modified", meta.LastModified.UTC().Format(http.TimeFormat))
@@ -627,10 +738,12 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	}
 
 	// Stream the object data
-	file, err := os.Open(actualObjectDataPath)
+	file, err := os.Open(objectDataPath)
 	if err != nil {
-		log.Printf("Error opening object data file %s: %v", actualObjectDataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		log.Printf("Error opening object data file %s: %v", objectDataPath, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading object data.")))
 		return
 	}
 	defer file.Close()
@@ -638,7 +751,6 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	w.WriteHeader(http.StatusOK)
 	if _, err := io.Copy(w, file); err != nil {
 		log.Printf("Error streaming object %s/%s to client: %v", bucketName, objectName, err)
-		// Client may have disconnected, too late to send an HTTP error status
 	}
 	log.Printf("Successfully served object %s/%s", bucketName, objectName)
 }
@@ -646,58 +758,66 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 func deleteObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
 	bucketPath := filepath.Join(dataDir, bucketName)
 	objectMetadataPath := filepath.Join(bucketPath, ".metadata", objectName+".meta")
+	objectDataPath := filepath.Join(bucketPath, objectName)
 
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for DeleteObject", bucketName)
-		// S3 typically returns 204 No Content even if the bucket doesn't exist, as the goal is object deletion.
-		// However, to be more explicit about the state, we can choose to return 404 if bucket is not found.
-		// For now, let's align with a common interpretation of 204 for object deletion idempotency.
+		// S3 returns 204 No Content for delete even if object doesn't exist
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 
-	// Attempt to read metadata to get the actual storage path, if it exists
-	var meta ObjectMetadata
+	// Try to read metadata to get actual storage path
+	var actualDataPath string
 	metaJSON, err := os.ReadFile(objectMetadataPath)
-	dataFileNotFound := false
 	if err == nil {
-		if jsonErr := json.Unmarshal(metaJSON, &meta); jsonErr == nil {
-			objectMetadataPath = meta.StoragePath // Use path from metadata if available
+		var meta ObjectMetadata
+		if jsonErr := json.Unmarshal(metaJSON, &meta); jsonErr == nil && meta.StoragePath != "" {
+			actualDataPath = meta.StoragePath
 		} else {
-			log.Printf("Warning: could not unmarshal metadata %s for %s/%s: %v. Proceeding with default path.", objectMetadataPath, bucketName, objectName, jsonErr)
+			actualDataPath = objectDataPath
 		}
-	} else if !os.IsNotExist(err) {
-		log.Printf("Error reading metadata file %s during delete: %v", objectMetadataPath, err)
-		// Don't fail here, still attempt to delete the primary object file if metadata read fails for other reasons.
+	} else {
+		actualDataPath = objectDataPath
 	}
 
 	// Delete the object data file
-	err = os.Remove(objectMetadataPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Printf("Error deleting object data file %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-	if os.IsNotExist(err) {
-		dataFileNotFound = true
+	dataDeleted := false
+	if err := os.Remove(actualDataPath); err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Error deleting object data file %s: %v", actualDataPath, err)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(errorToXML("InternalError", "Error deleting object data.")))
+			return
+		}
+	} else {
+		dataDeleted = true
 	}
 
 	// Delete the metadata file
-	metaErr := os.Remove(objectMetadataPath)
-	if metaErr != nil && !os.IsNotExist(metaErr) {
-		log.Printf("Error deleting metadata file %s: %v", objectMetadataPath, metaErr)
-		// If data file was deleted but metadata deletion fails, it's an inconsistent state.
-		// However, S3 delete is idempotent. Client expects 204.
-	}
-
-	if dataFileNotFound && os.IsNotExist(metaErr) {
-		log.Printf("Object %s/%s (and its metadata) did not exist for deletion.", bucketName, objectName)
+	metaDeleted := false
+	if err := os.Remove(objectMetadataPath); err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("Error deleting metadata file %s: %v", objectMetadataPath, err)
+			// Don't fail - data is already deleted
+		}
 	} else {
-		log.Printf("Successfully deleted object %s/%s (and/or its metadata)", bucketName, objectName)
+		metaDeleted = true
 	}
 
-	w.WriteHeader(http.StatusNoContent) // S3 spec: 204 No Content for successful deletion or if object didn't exist
+	// Clean up empty parent directories (best effort)
+	cleanupEmptyDirs(filepath.Dir(actualDataPath), bucketPath)
+	cleanupEmptyDirs(filepath.Dir(objectMetadataPath), filepath.Join(bucketPath, ".metadata"))
+
+	if dataDeleted || metaDeleted {
+		log.Printf("Successfully deleted object %s/%s", bucketName, objectName)
+	} else {
+		log.Printf("Object %s/%s did not exist for deletion", bucketName, objectName)
+	}
+
+	w.WriteHeader(http.StatusNoContent) // S3 spec: 204 No Content
 }
 
 func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
@@ -707,7 +827,7 @@ func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for HeadObject", bucketName)
-		http.Error(w, "NoSuchBucket", http.StatusNotFound) // S3 returns 404 if bucket doesn't exist for HEAD
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
@@ -715,32 +835,33 @@ func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 	metaJSON, err := os.ReadFile(objectMetadataPath)
 	if os.IsNotExist(err) {
 		log.Printf("Object metadata %s not found for %s/%s for HeadObject", objectMetadataPath, bucketName, objectName)
-		http.Error(w, "NoSuchKey", http.StatusNotFound) // S3 returns 404 if object doesn't exist for HEAD
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	if err != nil {
 		log.Printf("Error reading metadata file %s for HeadObject: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
 	var meta ObjectMetadata
 	if err := json.Unmarshal(metaJSON, &meta); err != nil {
 		log.Printf("Error unmarshalling metadata from %s for HeadObject: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	// Check if actual object data file exists (as per metadata)
-	// This ensures the metadata isn't stale.
+	// Check if actual object data file exists
 	if _, err := os.Stat(meta.StoragePath); os.IsNotExist(err) {
-		log.Printf("Object data file %s (from metadata) not found for %s/%s during HeadObject", meta.StoragePath, bucketName, objectName)
-		http.Error(w, "NoSuchKey", http.StatusNotFound) // Treat as if the key doesn't exist if data is missing
+		log.Printf("Object data file %s not found for %s/%s during HeadObject", meta.StoragePath, bucketName, objectName)
+		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 
 	// Set headers from metadata
-	w.Header().Set("Content-Type", meta.ContentType)
+	if meta.ContentType != "" {
+		w.Header().Set("Content-Type", meta.ContentType)
+	}
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", meta.ContentLength))
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", meta.ETag))
 	w.Header().Set("Last-Modified", meta.LastModified.UTC().Format(http.TimeFormat))
@@ -748,7 +869,7 @@ func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 		w.Header().Set(k, v)
 	}
 
-	w.WriteHeader(http.StatusOK) // HEAD requests return 200 OK with headers but no body
+	w.WriteHeader(http.StatusOK)
 	log.Printf("Successfully served HEAD for object %s/%s", bucketName, objectName)
 }
 
@@ -760,7 +881,9 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for ListObjectsV2", bucketName)
-		http.Error(w, errorToXML("NoSuchBucket", "The specified bucket does not exist."), http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
 		return
 	}
 
@@ -790,18 +913,38 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 	var commonPrefixesMap = make(map[string]struct{})
 	var allObjectKeys []string
 
-	metaFiles, err := os.ReadDir(metadataDir)
-	if err != nil && !os.IsNotExist(err) {
-		log.Printf("Error reading metadata directory %s: %v", metadataDir, err)
-		http.Error(w, errorToXML("InternalServerError", "Error listing objects."), http.StatusInternalServerError)
-		return
-	}
-
-	for _, metaFile := range metaFiles {
-		if !metaFile.IsDir() && strings.HasSuffix(metaFile.Name(), ".meta") {
-			objectKey := strings.TrimSuffix(metaFile.Name(), ".meta")
-			allObjectKeys = append(allObjectKeys, objectKey)
+	// Use filepath.WalkDir to handle nested paths
+	err := filepath.WalkDir(metadataDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
 		}
+		// Skip directories and non-.meta files
+		if d.IsDir() {
+			// Skip .uploads directory
+			if d.Name() == ".uploads" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), ".meta") {
+			return nil
+		}
+
+		// Calculate object key from path relative to metadata dir
+		relPath, err := filepath.Rel(metadataDir, path)
+		if err != nil {
+			return nil
+		}
+		objectKey := strings.TrimSuffix(relPath, ".meta")
+		allObjectKeys = append(allObjectKeys, objectKey)
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		log.Printf("Error walking metadata directory %s: %v", metadataDir, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error listing objects.")))
+		return
 	}
 	sort.Strings(allObjectKeys)
 
@@ -911,7 +1054,9 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 	x, err := xml.MarshalIndent(result, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling ListBucketResult to XML for bucket %s: %v", bucketName, err)
-		http.Error(w, errorToXML("InternalServerError", "Error formatting object list response."), http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error formatting object list response.")))
 		return
 	}
 
@@ -921,30 +1066,42 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 	log.Printf("Successfully served ListObjectsV2 for bucket %s", bucketName)
 }
 
-// Placeholder Multipart Handlers
+// Multipart Handlers
 func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
 	bucketPath := filepath.Join(dataDir, bucketName)
-	// Ensure bucket exists
-	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
-		log.Printf("Bucket %s does not exist for InitiateMultipartUpload", bucketName)
-		http.Error(w, "NoSuchBucket", http.StatusNotFound)
+
+	// Validate object key
+	if err := validateObjectKey(objectName); err != nil {
+		log.Printf("Invalid object key %s: %v", objectName, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidArgument", err.Error())))
 		return
 	}
 
-	// Generate a unique UploadID (e.g., UUID or a sufficiently random string)
-	// For simplicity, using timestamp + random number for now. Production systems need robust UUIDs.
-	uploadID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), objectName) // Basic unique ID
+	// Ensure bucket exists
+	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
+		log.Printf("Bucket %s does not exist for InitiateMultipartUpload", bucketName)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchBucket", "The specified bucket does not exist.")))
+		return
+	}
+
+	// Generate a unique UploadID
+	uploadID := fmt.Sprintf("%d-%s", time.Now().UnixNano(), objectName)
 	hash := md5.Sum([]byte(uploadID))
 	uploadID = hex.EncodeToString(hash[:])
 
 	uploadsDir := filepath.Join(bucketPath, ".metadata", ".uploads")
 	if err := os.MkdirAll(uploadsDir, 0755); err != nil {
 		log.Printf("Error creating .uploads directory %s: %v", uploadsDir, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating upload storage.")))
 		return
 	}
 
-	// Store information about this multipart upload
 	mpUpload := MultipartUpload{
 		UploadID:  uploadID,
 		Key:       objectName,
@@ -954,14 +1111,18 @@ func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	mpUploadJSON, err := json.MarshalIndent(mpUpload, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling multipart upload metadata for %s: %v", uploadID, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating upload metadata.")))
 		return
 	}
 
 	mpUploadMetaPath := filepath.Join(uploadsDir, uploadID+".json")
 	if err := os.WriteFile(mpUploadMetaPath, mpUploadJSON, 0644); err != nil {
 		log.Printf("Error writing multipart upload metadata file %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error writing upload metadata.")))
 		return
 	}
 
@@ -974,7 +1135,9 @@ func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	x, err := xml.MarshalIndent(result, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling InitiateMultipartUploadResult to XML: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error formatting response.")))
 		return
 	}
 
@@ -990,12 +1153,15 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 
 	partNumber, err := parseInt(partNumberStr, "partNumber")
 	if err != nil {
-		http.Error(w, "InvalidPartNumber", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidArgument", "Invalid part number.")))
 		return
 	}
-	// S3 part numbers are 1-based and up to 10000
 	if partNumber < 1 || partNumber > 10000 {
-		http.Error(w, "InvalidPartOrder: Part number must be an integer between 1 and 10000, inclusive.", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidArgument", "Part number must be between 1 and 10000.")))
 		return
 	}
 
@@ -1003,25 +1169,33 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 	metaJSON, err := os.ReadFile(mpUploadMetaPath)
 	if os.IsNotExist(err) {
 		log.Printf("Multipart upload metadata %s not found for UploadID %s", mpUploadMetaPath, uploadID)
-		http.Error(w, "NoSuchUpload", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchUpload", "The specified multipart upload does not exist.")))
 		return
 	}
 	if err != nil {
 		log.Printf("Error reading multipart upload metadata %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading upload metadata.")))
 		return
 	}
 
 	var mpUpload MultipartUpload
 	if err := json.Unmarshal(metaJSON, &mpUpload); err != nil {
 		log.Printf("Error unmarshalling multipart upload metadata from %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error parsing upload metadata.")))
 		return
 	}
 
 	if mpUpload.Key != objectName {
 		log.Printf("Object name mismatch for UploadID %s. Expected %s, got %s", uploadID, mpUpload.Key, objectName)
-		http.Error(w, "NoSuchUpload", http.StatusNotFound) // Or a more specific error
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchUpload", "The specified multipart upload does not exist.")))
 		return
 	}
 
@@ -1029,35 +1203,38 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		log.Printf("Error reading request body for part %d of %s/%s (UploadID %s): %v", partNumber, bucketName, objectName, uploadID, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading part data.")))
 		return
 	}
 	defer r.Body.Close()
 
 	partSize := int64(len(body))
-	// S3 part size limits (except for the last part)
-	// For simplicity, we are not strictly enforcing the 5MB minimum here, but real S3 does.
 
 	// Calculate ETag for the part (MD5 hash)
 	hash := md5.Sum(body)
 	eTag := hex.EncodeToString(hash[:])
 
-	// Store the part data temporarily
-	// Parts are stored in a subdirectory named after the UploadID
+	// Store the part data
 	partsDir := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+"_parts")
 	if err := os.MkdirAll(partsDir, 0755); err != nil {
 		log.Printf("Error creating directory for parts %s: %v", partsDir, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating part storage.")))
 		return
 	}
 	partPath := filepath.Join(partsDir, fmt.Sprintf("part-%d", partNumber))
 	if err := os.WriteFile(partPath, body, 0644); err != nil {
 		log.Printf("Error writing part data to %s: %v", partPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error writing part data.")))
 		return
 	}
 
-	// Update multipart upload metadata with this part's info
+	// Update multipart upload metadata
 	mpUpload.Parts[partNumber] = PartMetadata{
 		PartNumber: partNumber,
 		ETag:       eTag,
@@ -1068,12 +1245,16 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 	updatedMetaJSON, err := json.MarshalIndent(mpUpload, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling updated multipart upload metadata for %s: %v", uploadID, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error updating upload metadata.")))
 		return
 	}
 	if err := os.WriteFile(mpUploadMetaPath, updatedMetaJSON, 0644); err != nil {
 		log.Printf("Error writing updated multipart upload metadata file %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error saving upload metadata.")))
 		return
 	}
 
@@ -1091,25 +1272,33 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	metaJSON, err := os.ReadFile(mpUploadMetaPath)
 	if os.IsNotExist(err) {
 		log.Printf("Multipart upload metadata %s not found for UploadID %s (Complete)", mpUploadMetaPath, uploadID)
-		http.Error(w, "NoSuchUpload", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchUpload", "The specified multipart upload does not exist.")))
 		return
 	}
 	if err != nil {
 		log.Printf("Error reading multipart upload metadata %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error reading upload metadata.")))
 		return
 	}
 
 	var mpUpload MultipartUpload
 	if err := json.Unmarshal(metaJSON, &mpUpload); err != nil {
 		log.Printf("Error unmarshalling multipart upload metadata from %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error parsing upload metadata.")))
 		return
 	}
 
 	if mpUpload.Key != objectName {
 		log.Printf("Object name mismatch for UploadID %s during complete. Expected %s, got %s", uploadID, mpUpload.Key, objectName)
-		http.Error(w, "NoSuchUpload", http.StatusNotFound) // Or a more specific error
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchUpload", "The specified multipart upload does not exist.")))
 		return
 	}
 
@@ -1117,22 +1306,38 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	var completeRequest CompleteMultipartUpload
 	if err := xml.NewDecoder(r.Body).Decode(&completeRequest); err != nil {
 		log.Printf("Error decoding CompleteMultipartUpload XML for %s/%s (UploadID %s): %v", bucketName, objectName, uploadID, err)
-		http.Error(w, "InvalidRequest: Could not parse XML", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("MalformedXML", "The XML you provided was not well-formed.")))
 		return
 	}
 	defer r.Body.Close()
 
 	if len(completeRequest.Parts) == 0 {
-		http.Error(w, "InvalidPart: You must specify at least one part.", http.StatusBadRequest)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(errorToXML("InvalidPart", "You must specify at least one part.")))
 		return
 	}
 
 	// Verify parts and prepare for assembly
+	// Object data stored directly in bucket (consistent with putObjectHandler)
 	finalObjectPath := filepath.Join(bucketPath, objectName)
+
+	// Create parent directories if needed
+	if err := os.MkdirAll(filepath.Dir(finalObjectPath), 0755); err != nil {
+		log.Printf("Error creating parent directories for final object %s: %v", finalObjectPath, err)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating object storage.")))
+		return
+	}
 	finalObjectFile, err := os.OpenFile(finalObjectPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		log.Printf("Error creating final object file %s: %v", finalObjectPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating object file.")))
 		return
 	}
 	defer finalObjectFile.Close()
@@ -1143,40 +1348,49 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	for i, partToUpload := range completeRequest.Parts {
 		// S3: Parts must be ordered by PartNumber
 		if i > 0 && partToUpload.PartNumber <= completeRequest.Parts[i-1].PartNumber {
-			http.Error(w, "InvalidPartOrder: Parts must be ordered by part number.", http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errorToXML("InvalidPartOrder", "Parts must be ordered by part number.")))
 			return
 		}
 
 		storedPartMeta, ok := mpUpload.Parts[partToUpload.PartNumber]
 		if !ok {
 			log.Printf("Part number %d not found in multipart upload %s", partToUpload.PartNumber, uploadID)
-			http.Error(w, fmt.Sprintf("InvalidPart: Part number %d not found in upload.", partToUpload.PartNumber), http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errorToXML("InvalidPart", fmt.Sprintf("Part number %d not found in upload.", partToUpload.PartNumber))))
 			return
 		}
-		// S3 ETags are quoted, the request might send them quoted or not. Be flexible or strict.
-		// Here, we assume the stored ETag is unquoted, and the request ETag might be quoted.
+		// Handle quoted ETags
 		requestETag := strings.Trim(partToUpload.ETag, "\"")
 		if storedPartMeta.ETag != requestETag {
 			log.Printf("ETag mismatch for part %d of upload %s. Expected %s, got %s", partToUpload.PartNumber, uploadID, storedPartMeta.ETag, requestETag)
-			http.Error(w, fmt.Sprintf("InvalidPart: ETag mismatch for part number %s.", partToUpload.ETag), http.StatusBadRequest)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errorToXML("InvalidPart", fmt.Sprintf("ETag mismatch for part number %d.", partToUpload.PartNumber))))
 			return
 		}
 
 		partFile, err := os.Open(storedPartMeta.StoredPath)
 		if err != nil {
 			log.Printf("Error opening part data %s for assembly: %v", storedPartMeta.StoredPath, err)
-			http.Error(w, "InternalServerError: Could not access part data.", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(errorToXML("InternalError", "Could not access part data.")))
 			return
 		}
 		written, err := io.Copy(finalObjectFile, partFile)
-		partFile.Close() // Close immediately after copy
+		partFile.Close()
 		if err != nil {
 			log.Printf("Error copying part %d data to final object: %v", storedPartMeta.PartNumber, err)
-			http.Error(w, "InternalServerError: Error during assembly.", http.StatusInternalServerError)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusInternalServerError)
+			w.Write([]byte(errorToXML("InternalError", "Error during object assembly.")))
 			return
 		}
 		totalSize += written
-		partETags = append(partETags, storedPartMeta.ETag) // Use the unquoted ETag
+		partETags = append(partETags, storedPartMeta.ETag)
 	}
 
 	// Calculate final ETag for the assembled object
@@ -1189,30 +1403,44 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	}
 	finalETag := fmt.Sprintf("\"%s-%d\"", hex.EncodeToString(finalETagHash.Sum(nil)), len(partETags))
 
-	// Store metadata for the completed object (similar to PutObject)
+	// Store metadata for the completed object (consistent with PutObject)
 	objectMetadataDir := filepath.Join(bucketPath, ".metadata")
 	objectMetadataPath := filepath.Join(objectMetadataDir, objectName+".meta")
 
-	meta := ObjectMetadata{
-		ContentType:    r.Header.Get("Content-Type"), // Or determine from first part / user input
-		ContentLength:  totalSize,
-		ETag:           strings.Trim(finalETag, "\""), // Store unquoted ETag
-		CustomMetadata: make(map[string]string),       // TODO: Handle x-amz-meta-* headers from initiate or complete?
-		LastModified:   time.Now().UTC(),
-		StoragePath:    finalObjectPath,
+	// Create parent directories for metadata
+	if err := os.MkdirAll(filepath.Dir(objectMetadataPath), 0755); err != nil {
+		log.Printf("Error creating metadata directories for %s: %v", objectMetadataPath, err)
+		os.Remove(finalObjectPath) // Clean up assembled object
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating metadata storage.")))
+		return
 	}
-	// Populate custom metadata if any were passed during Initiate (not implemented yet)
+
+	meta := ObjectMetadata{
+		ContentType:    r.Header.Get("Content-Type"),
+		ContentLength:  totalSize,
+		ETag:           strings.Trim(finalETag, "\""),
+		CustomMetadata: make(map[string]string),
+		LastModified:   time.Now().UTC(),
+		StoragePath:    finalObjectPath, // Points to actual object data
+	}
 
 	metaJSONOutput, err := json.MarshalIndent(meta, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling final object metadata for %s/%s: %v", bucketName, objectName, err)
-		// Object assembled, but metadata failed. Critical error.
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		os.Remove(finalObjectPath)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error creating metadata.")))
 		return
 	}
 	if err := os.WriteFile(objectMetadataPath, metaJSONOutput, 0644); err != nil {
 		log.Printf("Error writing final object metadata file %s: %v", objectMetadataPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		os.Remove(finalObjectPath)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error writing metadata.")))
 		return
 	}
 
@@ -1252,25 +1480,28 @@ func abortMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketN
 	_, err := os.Stat(mpUploadMetaPath)
 	if os.IsNotExist(err) {
 		log.Printf("Multipart upload metadata %s not found for UploadID %s (Abort)", mpUploadMetaPath, uploadID)
-		http.Error(w, "NoSuchUpload", http.StatusNotFound)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		w.Write([]byte(errorToXML("NoSuchUpload", "The specified multipart upload does not exist.")))
 		return
 	}
 
 	// Delete the multipart upload metadata file
 	if err := os.Remove(mpUploadMetaPath); err != nil && !os.IsNotExist(err) {
 		log.Printf("Error deleting multipart upload metadata file %s: %v", mpUploadMetaPath, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusInternalServerError)
+		w.Write([]byte(errorToXML("InternalError", "Error aborting upload.")))
 		return
 	}
 
 	// Delete the temporary parts directory
 	if err := os.RemoveAll(partsDir); err != nil && !os.IsNotExist(err) {
 		log.Printf("Error deleting temporary parts directory %s: %v", partsDir, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
+		// Don't fail - metadata already deleted
 	}
 
-	w.WriteHeader(http.StatusNoContent) // S3 spec: 204 No Content for successful abort
+	w.WriteHeader(http.StatusNoContent)
 	log.Printf("Successfully aborted multipart upload for %s/%s, UploadID: %s", bucketName, objectName, uploadID)
 }
 
@@ -1354,9 +1585,6 @@ func getCanonicalQueryString(r *http.Request) string {
 
 func getCanonicalHeaders(r *http.Request, signedHeaderNames []string) (string, string) {
 	var canonicalHeaders strings.Builder
-	// Ensure 'host' header is always part of signed headers if not explicitly passed (it usually is)
-	// For SigV4, the actual header names in signedHeaderNames must match what's in the request.
-	// The list of signed headers comes from the Authorization header itself.
 
 	// Create a map for quick lookup of signed headers
 	signedHeadersMap := make(map[string]bool)
@@ -1364,15 +1592,22 @@ func getCanonicalHeaders(r *http.Request, signedHeaderNames []string) (string, s
 		signedHeadersMap[strings.ToLower(h)] = true
 	}
 
-	var actualSignedHeadersForOutput []string // Store the headers that were actually found and signed
+	var actualSignedHeadersForOutput []string
 	var headerPairs [][2]string
+
+	// Handle the 'host' header specially - Go stores it in r.Host, not r.Header
+	if signedHeadersMap["host"] && r.Host != "" {
+		headerPairs = append(headerPairs, [2]string{"host", r.Host})
+		actualSignedHeadersForOutput = append(actualSignedHeadersForOutput, "host")
+	}
 
 	for name, values := range r.Header {
 		lowerName := strings.ToLower(name)
+		// Skip 'host' since we handled it above
+		if lowerName == "host" {
+			continue
+		}
 		if signedHeadersMap[lowerName] {
-			// S3: Multiple headers with the same name should be joined by a comma (after stripping whitespace)
-			// However, http.Header canonicalizes to one entry with comma-separated values for most common headers.
-			// For other headers, it might be a slice. We should handle this by joining.
 			var processedValues []string
 			for _, v := range values {
 				processedValues = append(processedValues, strings.TrimSpace(v))
@@ -1404,10 +1639,11 @@ func getPayloadHash(r *http.Request) (string, []byte, error) {
 	if xAmzContentSHA256 == unsignedPayload {
 		return unsignedPayload, nil, nil
 	}
-	if xAmzContentSHA256 == streamingPayload {
-		// Streaming payload is more complex and not handled in this basic version
-		log.Println("Warning: STREAMING-AWS4-HMAC-SHA256-PAYLOAD is not fully supported for hashing in this version.")
-		return streamingPayload, nil, nil // Or handle as an error
+	// Handle various streaming payload types (AWS CLI v2 uses STREAMING-UNSIGNED-PAYLOAD-TRAILER)
+	if strings.HasPrefix(xAmzContentSHA256, "STREAMING-") {
+		// Streaming payloads are signed differently - treat as unsigned for basic implementation
+		log.Printf("Note: Streaming payload type '%s' - accepting without body hash verification", xAmzContentSHA256)
+		return xAmzContentSHA256, nil, nil
 	}
 
 	bodyBytes, err := io.ReadAll(r.Body)
@@ -1572,8 +1808,64 @@ func parseInt(valueStr string, paramName string) (int, error) {
 	return val, nil
 }
 
-// TODO: Implement XML response structures
-// TODO: Implement metadata storage (e.g., in a .metadata hidden folder within the bucket)
-// TODO: Implement ETag calculation
-// TODO: Implement ACLs/Policy (stubbed for now)
-// TODO: Implement robust authentication (HMAC)
+// validateBucketName validates S3 bucket naming rules
+func validateBucketName(name string) error {
+	if len(name) < 3 || len(name) > 63 {
+		return fmt.Errorf("bucket name must be between 3 and 63 characters")
+	}
+	// Must start with lowercase letter or number
+	if !((name[0] >= 'a' && name[0] <= 'z') || (name[0] >= '0' && name[0] <= '9')) {
+		return fmt.Errorf("bucket name must start with a lowercase letter or number")
+	}
+	// Must end with lowercase letter or number
+	last := name[len(name)-1]
+	if !((last >= 'a' && last <= 'z') || (last >= '0' && last <= '9')) {
+		return fmt.Errorf("bucket name must end with a lowercase letter or number")
+	}
+	// Check valid characters and no consecutive periods
+	prevChar := byte(0)
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '.') {
+			return fmt.Errorf("bucket name can only contain lowercase letters, numbers, hyphens, and periods")
+		}
+		if c == '.' && prevChar == '.' {
+			return fmt.Errorf("bucket name cannot have consecutive periods")
+		}
+		prevChar = c
+	}
+	// Cannot be formatted as IP address
+	if regexp.MustCompile(`^\d+\.\d+\.\d+\.\d+$`).MatchString(name) {
+		return fmt.Errorf("bucket name cannot be formatted as an IP address")
+	}
+	return nil
+}
+
+// validateObjectKey validates S3 object key constraints
+func validateObjectKey(key string) error {
+	if len(key) == 0 {
+		return fmt.Errorf("object key cannot be empty")
+	}
+	if len(key) > 1024 {
+		return fmt.Errorf("object key cannot exceed 1024 characters")
+	}
+	// Check for null bytes
+	if strings.ContainsRune(key, 0) {
+		return fmt.Errorf("object key cannot contain null bytes")
+	}
+	return nil
+}
+
+// cleanupEmptyDirs removes empty directories up to stopAt directory
+func cleanupEmptyDirs(dir, stopAt string) {
+	for dir != stopAt && dir != "." && dir != "/" {
+		entries, err := os.ReadDir(dir)
+		if err != nil || len(entries) > 0 {
+			break
+		}
+		if err := os.Remove(dir); err != nil {
+			break
+		}
+		dir = filepath.Dir(dir)
+	}
+}
