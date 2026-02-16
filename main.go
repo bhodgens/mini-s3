@@ -218,6 +218,10 @@ func main() {
 		}
 	}
 
+	// Initialize inactivity tracker and load bucket action timers
+	InitInactivityTracker()
+	initializeInactivityTimers()
+
 	http.HandleFunc("/", rootHandler)
 	log.Println("Starting S3 server on :8443 (HTTPS)")
 	// Assumes certs/cert.pem and certs/key.pem exist
@@ -806,6 +810,18 @@ func putObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 	log.Printf("Successfully put object %s/%s, ETag: %s", bucketName, objectName, eTag)
 	w.Header().Set("ETag", fmt.Sprintf("\"%s\"", eTag))
 	w.WriteHeader(http.StatusOK)
+
+	// Trigger after_upload actions
+	go triggerActions("after_upload", ActionContext{
+		FilePath:     objectDataPath,
+		MetadataPath: objectMetadataPath,
+		BucketName:   bucketName,
+		BucketPath:   bucketPath,
+		ObjectKey:    objectName,
+		ContentType:  meta.ContentType,
+		ETag:         eTag,
+		Size:         meta.ContentLength,
+	})
 }
 
 func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
@@ -884,6 +900,18 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 		log.Printf("Error streaming object %s/%s to client: %v", bucketName, objectName, err)
 	}
 	log.Printf("Successfully served object %s/%s", bucketName, objectName)
+
+	// Trigger after_download actions
+	go triggerActions("after_download", ActionContext{
+		FilePath:     objectDataPath,
+		MetadataPath: objectMetadataPath,
+		BucketName:   bucketName,
+		BucketPath:   bucketPath,
+		ObjectKey:    objectName,
+		ContentType:  meta.ContentType,
+		ETag:         meta.ETag,
+		Size:         meta.ContentLength,
+	})
 }
 
 func deleteObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
@@ -944,6 +972,15 @@ func deleteObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, obj
 
 	if dataDeleted || metaDeleted {
 		log.Printf("Successfully deleted object %s/%s", bucketName, objectName)
+
+		// Trigger after_delete actions
+		go triggerActions("after_delete", ActionContext{
+			FilePath:     actualDataPath,
+			MetadataPath: objectMetadataPath,
+			BucketName:   bucketName,
+			BucketPath:   bucketPath,
+			ObjectKey:    objectName,
+		})
 	} else {
 		log.Printf("Object %s/%s did not exist for deletion", bucketName, objectName)
 	}
@@ -1600,6 +1637,18 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	w.WriteHeader(http.StatusOK)
 	w.Write(x)
 	log.Printf("Successfully completed multipart upload for %s/%s, UploadID: %s, Final ETag: %s", bucketName, objectName, uploadID, finalETag)
+
+	// Trigger after_upload actions for completed multipart upload
+	go triggerActions("after_upload", ActionContext{
+		FilePath:     finalObjectPath,
+		MetadataPath: objectMetadataPath,
+		BucketName:   bucketName,
+		BucketPath:   bucketPath,
+		ObjectKey:    objectName,
+		ContentType:  meta.ContentType,
+		ETag:         strings.Trim(finalETag, "\""),
+		Size:         totalSize,
+	})
 }
 
 func abortMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName, uploadID string) {

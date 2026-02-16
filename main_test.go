@@ -179,12 +179,12 @@ func setupTestServer(t *testing.T) *testServer {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
 
-	// Override dataDir for testing
-	origDataDir := dataDir
+	// Override serverConfig.DataDir for testing
+	origDataDir := serverConfig.DataDir
+	serverConfig.DataDir = tmpDir
 	t.Cleanup(func() {
 		os.RemoveAll(tmpDir)
-		// Note: Can't restore dataDir as it's a const. Tests should be run in isolation.
-		_ = origDataDir
+		serverConfig.DataDir = origDataDir
 	})
 
 	return &testServer{

@@ -1,0 +1,112 @@
+{
+  // .bucket-actions - Event-based actions configuration for mini-s3
+  // Place this file in any bucket directory or subdirectory.
+  // Subdirectories inherit parent actions and can override them.
+  //
+  // JSON5 format: supports // and /* */ comments
+
+  "version": "1.0",
+
+  // Actions triggered after an object is uploaded (PUT or multipart complete)
+  "after_upload": [
+    {
+      "name": "thumbnail-generator",
+      "description": "Generate thumbnails for uploaded images",
+      // Glob patterns to match object keys (empty array = match all)
+      "patterns": ["*.jpg", "*.jpeg", "*.png", "*.gif"],
+      // Shell command to execute. Available variables:
+      //   $FILE_PATH     - Full path to the object data file
+      //   $METADATA_PATH - Path to the .metadata/<object>.meta file
+      //   $BUCKET_NAME   - S3 bucket name
+      //   $BUCKET_PATH   - Filesystem path to bucket root
+      //   $OBJECT_KEY    - Object key within bucket
+      //   $CONTENT_TYPE  - MIME type from metadata
+      //   $ETAG          - Object ETag (MD5 hash)
+      //   $SIZE          - Object size in bytes
+      "command": "/usr/local/bin/generate-thumbnail.sh \"$FILE_PATH\" \"$BUCKET_PATH/.thumbs/\"",
+      // Run asynchronously (non-blocking). Default: true
+      "async": true,
+      // Timeout in seconds (0 = no limit). Default: 0
+      "timeout": 60,
+      // Enable/disable this action. Default: true
+      "enabled": true
+    },
+    {
+      "name": "notify-upload",
+      "description": "Send notification for large uploads",
+      "patterns": ["*"],
+      // Use shell conditionals based on size
+      "command": "if [ $SIZE -gt 10485760 ]; then echo \"Large file uploaded: $OBJECT_KEY ($SIZE bytes)\" | /usr/bin/notify-send; fi",
+      "async": true
+    },
+    {
+      "name": "video-transcode",
+      "description": "Transcode uploaded videos to web-friendly format",
+      "patterns": ["*.mp4", "*.mov", "*.avi", "*.mkv"],
+      "command": "/usr/local/bin/transcode-video.sh \"$FILE_PATH\"",
+      "async": true,
+      "timeout": 3600  // 1 hour timeout for video processing
+    }
+  ],
+
+  // Actions triggered after an object is downloaded (GET)
+  "after_download": [
+    {
+      "name": "ephemeral-cleanup",
+      "description": "Delete ephemeral files after download",
+      // Only match files in the ephemeral/ prefix
+      "patterns": ["ephemeral/*"],
+      "command": "rm -f \"$FILE_PATH\" && rm -f \"$METADATA_PATH\"",
+      // Run synchronously to ensure cleanup before next request
+      "async": false,
+      "timeout": 10
+    },
+    {
+      "name": "download-audit",
+      "description": "Log all downloads for auditing",
+      "patterns": ["*"],
+      "command": "echo \"$(date -Iseconds) DOWNLOAD $BUCKET_NAME/$OBJECT_KEY\" >> /var/log/s3-downloads.log",
+      "async": true
+    }
+  ],
+
+  // Actions triggered after an object is deleted (DELETE)
+  "after_delete": [
+    {
+      "name": "thumbnail-cleanup",
+      "description": "Remove thumbnails when source images are deleted",
+      "patterns": ["*.jpg", "*.jpeg", "*.png", "*.gif"],
+      "command": "rm -f \"$BUCKET_PATH/.thumbs/$(basename \"$OBJECT_KEY\")\"",
+      "async": true
+    },
+    {
+      "name": "delete-audit",
+      "description": "Log all deletions for compliance",
+      "patterns": ["*"],
+      "command": "echo \"$(date -Iseconds) DELETE $BUCKET_NAME/$OBJECT_KEY\" >> /var/log/s3-deletions.log",
+      "async": true
+    }
+  ],
+
+  // Inactivity timeout - triggers when bucket has no activity for specified duration
+  "inactivity_timeout": {
+    // Duration format: number + unit (s=seconds, m=minutes, h=hours, d=days)
+    "duration": "30m",
+    "description": "Create ZFS snapshot after 30 minutes of inactivity",
+    // Command to run when inactivity timeout fires
+    "command": "zfs snapshot tank/data@auto-$(date +%Y%m%d-%H%M%S)",
+    // Activity types that reset the timer: "upload", "download", "delete"
+    // Empty array or omit to reset on any activity
+    "reset_on": ["upload", "delete"],
+    "enabled": true
+  },
+
+  // Inheritance configuration for subdirectories
+  "inheritance": {
+    // Mode options:
+    //   "merge"    - (default) Child actions added; same-name actions override parent
+    //   "override" - Child completely replaces parent actions
+    //   "disable"  - Only current directory's actions apply, ignore all parents
+    "mode": "merge"
+  }
+}

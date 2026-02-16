@@ -294,6 +294,81 @@ Run integration tests (requires server to be running):
 
 See [docs/gap-closure.md](docs/gap-closure.md) for the history of issues that were identified and fixed during development.
 
+## Event Actions
+
+mini-s3 supports configurable event-based actions that execute shell commands in response to S3 operations. Actions are configured via `.bucket-actions` files (JSON5 format) placed in bucket directories.
+
+### Use Cases
+
+- **Post-upload processing**: thumbnail generation, video transcoding, backup notifications
+- **Delete-after-download**: ephemeral file cleanup
+- **Inactivity snapshots**: ZFS snapshots after periods of no activity
+- **Audit logging**: track all downloads/uploads
+
+### Configuration
+
+Place a `.bucket-actions` file in any bucket directory or subdirectory. Subdirectories inherit parent actions and can override them. See `bucket-actions.sample.json5` for a complete example.
+
+```json5
+{
+  "version": "1.0",
+  "after_upload": [
+    {
+      "name": "thumbnail-generator",
+      "patterns": ["*.jpg", "*.png"],
+      "command": "/scripts/thumb.sh \"$FILE_PATH\"",
+      "async": true,
+      "timeout": 60
+    }
+  ],
+  "after_download": [...],
+  "after_delete": [...],
+  "inactivity_timeout": {
+    "duration": "30m",
+    "command": "zfs snapshot tank/data@$(date +%s)",
+    "reset_on": ["upload", "delete"]
+  }
+}
+```
+
+### Available Variables
+
+| Variable | Description |
+|----------|-------------|
+| `$FILE_PATH` | Full path to object data file |
+| `$METADATA_PATH` | Path to `.metadata/<obj>.meta` |
+| `$BUCKET_NAME` | S3 bucket name |
+| `$BUCKET_PATH` | Filesystem path to bucket root |
+| `$OBJECT_KEY` | Object key within bucket |
+| `$CONTENT_TYPE` | MIME type |
+| `$ETAG` | Object ETag (MD5) |
+| `$SIZE` | Size in bytes |
+
+### Inheritance
+
+When an object operation occurs, actions are loaded from the bucket root through all parent directories to the object's location:
+
+| Mode | Behavior |
+|------|----------|
+| `merge` (default) | Child actions added; same-name actions override parent |
+| `override` | Child completely replaces parent |
+| `disable` | Only current directory's actions apply |
+
+### Security Notes
+
+1. **Variable quoting**: Always quote variables in commands (`"$FILE_PATH"`)
+2. **Permissions**: Commands run as the server process user
+3. **Timeouts**: Enforce timeouts to prevent runaway processes
+4. **Async**: Actions run asynchronously by default (non-blocking)
+
+### Discovery Script
+
+Use `scripts/show-bucket-actions.sh` to view all configured actions:
+
+```bash
+./scripts/show-bucket-actions.sh data/
+```
+
 ## TODO / Potential Enhancements
 
 *   More robust error handling and S3 error code compliance.
