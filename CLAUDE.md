@@ -18,14 +18,19 @@ This is a single-file Go S3-compatible server (`main.go`) implementing core S3 o
 ### Storage Layout
 
 ```
-./data/
-  <bucket>/
+<dataDir>/                  # Configurable via config.json (default: ./data/)
+  <bucket>/                 # Auto-discovered bucket (or symlink to dir)
     <object-file>           # Actual object data for simple PUT
     .metadata/
       <object>.meta         # JSON metadata file per object
       .uploads/
         <uploadId>.json     # Multipart upload session metadata
         <uploadId>_parts/   # Temporary part files during multipart
+
+<custom-bucket-path>/       # Custom bucket from config.json "buckets" map
+  <object-file>
+  .metadata/
+    ...
 ```
 
 ### Request Flow
@@ -41,11 +46,34 @@ This is a single-file Go S3-compatible server (`main.go`) implementing core S3 o
 - **Object Metadata**: `ObjectMetadata` struct stored as JSON, tracks content type, ETag (MD5), custom x-amz-meta-* headers, and storage path.
 - **Multipart Uploads**: Three-phase flow (initiate/upload parts/complete) with `MultipartUpload` tracking part ETags and temporary storage.
 
+### Configuration
+
+The server loads configuration from `config.json` (or path specified by `MINIS3_CONFIG` env var).
+
+```json
+{
+  "dataDir": "./data/",
+  "buckets": {
+    "photos": "/mnt/storage/photos",
+    "backups": "/var/backups/s3-mirror"
+  }
+}
+```
+
+- **dataDir**: Root directory for auto-discovered buckets (default: `./data/`)
+- **buckets**: Map of bucket names to custom filesystem paths. These buckets:
+  - Appear in ListBuckets alongside auto-discovered buckets
+  - Cannot be created or deleted via the S3 API
+  - Can point to any directory (including symlinks)
+
+**Symlink support**: Both the `dataDir` scan and custom bucket paths follow symlinks correctly.
+
 ### Credentials
 
 Set via environment variables or defaults to `minioadmin`/`minioadmin`:
 - `MINIS3_ACCESS_KEY` - Access Key ID
 - `MINIS3_SECRET_KEY` - Secret Access Key
+- `MINIS3_CONFIG` - Path to config file (default: `config.json`)
 
 ### Testing with AWS CLI
 

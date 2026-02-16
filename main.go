@@ -24,7 +24,6 @@ import (
 )
 
 const (
-	dataDir          = "./data/"
 	awsAlgorithm     = "AWS4-HMAC-SHA256"
 	defaultRegion    = "us-east-1" // Default region for our S3 server
 	serviceName      = "s3"
@@ -32,7 +31,69 @@ const (
 	streamingPayload = "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
 	iso8601Format    = "20060102T150405Z"
 	shortDateFormat  = "20060102"
+	defaultDataDir   = "./data/"
+	defaultConfigFile = "config.json"
 )
+
+// ServerConfig holds the server configuration loaded from JSON
+type ServerConfig struct {
+	DataDir string            `json:"dataDir"` // Root directory for bucket storage
+	Buckets map[string]string `json:"buckets"` // Custom bucket name -> path mappings
+}
+
+var serverConfig = ServerConfig{
+	DataDir: defaultDataDir,
+	Buckets: make(map[string]string),
+}
+
+// loadConfig loads server configuration from a JSON file
+func loadConfig(configPath string) error {
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		log.Printf("Config file %s not found, using defaults", configPath)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("error reading config file: %w", err)
+	}
+
+	if err := json.Unmarshal(data, &serverConfig); err != nil {
+		return fmt.Errorf("error parsing config file: %w", err)
+	}
+
+	// Ensure DataDir has trailing slash
+	if serverConfig.DataDir != "" && !strings.HasSuffix(serverConfig.DataDir, "/") {
+		serverConfig.DataDir += "/"
+	}
+	if serverConfig.DataDir == "" {
+		serverConfig.DataDir = defaultDataDir
+	}
+	if serverConfig.Buckets == nil {
+		serverConfig.Buckets = make(map[string]string)
+	}
+
+	log.Printf("Loaded config: DataDir=%s, CustomBuckets=%d", serverConfig.DataDir, len(serverConfig.Buckets))
+	return nil
+}
+
+// getBucketPath returns the filesystem path for a bucket.
+// It checks custom bucket mappings first, then falls back to dataDir.
+func getBucketPath(bucketName string) string {
+	if customPath, ok := serverConfig.Buckets[bucketName]; ok {
+		return customPath
+	}
+	return filepath.Join(serverConfig.DataDir, bucketName)
+}
+
+// bucketExists checks if a bucket exists (follows symlinks)
+func bucketExists(bucketName string) bool {
+	bucketPath := getBucketPath(bucketName)
+	info, err := os.Stat(bucketPath) // os.Stat follows symlinks
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
 
 // Credentials store (simple hardcoded version)
 // TODO: Load from environment variables or config file
@@ -132,10 +193,28 @@ func errorToXML(code, message string) string {
 }
 
 func main() {
+	// Load configuration
+	configPath := getEnvOrDefault("MINIS3_CONFIG", defaultConfigFile)
+	if err := loadConfig(configPath); err != nil {
+		log.Fatalf("Failed to load config: %v", err)
+	}
+
 	// Ensure data directory exists
-	if _, err := os.Stat(dataDir); os.IsNotExist(err) {
-		if err := os.MkdirAll(dataDir, 0755); err != nil {
+	if _, err := os.Stat(serverConfig.DataDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(serverConfig.DataDir, 0755); err != nil {
 			log.Fatalf("Failed to create data directory: %v", err)
+		}
+	}
+
+	// Validate custom bucket paths exist
+	for bucketName, bucketPath := range serverConfig.Buckets {
+		info, err := os.Stat(bucketPath)
+		if err != nil {
+			log.Printf("Warning: Custom bucket '%s' path '%s' error: %v", bucketName, bucketPath, err)
+			continue
+		}
+		if !info.IsDir() {
+			log.Printf("Warning: Custom bucket '%s' path '%s' is not a directory", bucketName, bucketPath)
 		}
 	}
 
@@ -370,30 +449,66 @@ type CompletedMultipartUploadResult struct {
 
 // Placeholder handlers - to be implemented in handlers.go or similar
 func listBucketsHandler(w http.ResponseWriter, r *http.Request) {
-	dirs, err := os.ReadDir(dataDir)
-	if err != nil {
-		log.Printf("Error reading data directory %s: %v", dataDir, err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
+	bucketSet := make(map[string]Bucket) // Use map to deduplicate
+
+	// First, add all custom-configured buckets
+	for bucketName, bucketPath := range serverConfig.Buckets {
+		info, err := os.Stat(bucketPath) // os.Stat follows symlinks
+		if err != nil {
+			log.Printf("Warning: Custom bucket '%s' at '%s' not accessible: %v", bucketName, bucketPath, err)
+			continue
+		}
+		if !info.IsDir() {
+			continue
+		}
+		creationDate := info.ModTime().UTC().Format("2006-01-02T15:04:05.000Z")
+		bucketSet[bucketName] = Bucket{Name: bucketName, CreationDate: creationDate}
 	}
 
-	var s3Buckets []Bucket
-	for _, dir := range dirs {
-		if dir.IsDir() && !strings.HasPrefix(dir.Name(), ".") { // Exclude hidden dirs like .metadata if any at root
-			// For CreationDate, we need to get it from the bucket's .metadata or the dir itself.
-			// For simplicity, using directory modification time for now.
-			// A more accurate way would be to store creation date in a metadata file inside the bucket.
-			info, err := dir.Info()
-			var creationDate string
-			if err == nil {
-				creationDate = info.ModTime().UTC().Format("2006-01-02T15:04:05.000Z")
-			} else {
-				creationDate = time.Now().UTC().Format("2006-01-02T15:04:05.000Z") // Fallback
-				log.Printf("Warning: Could not get info for bucket %s: %v", dir.Name(), err)
+	// Then, scan the data directory for buckets (including symlinks)
+	dirs, err := os.ReadDir(serverConfig.DataDir)
+	if err != nil {
+		log.Printf("Error reading data directory %s: %v", serverConfig.DataDir, err)
+		// Don't fail if we have custom buckets
+		if len(bucketSet) == 0 {
+			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			return
+		}
+	} else {
+		for _, dir := range dirs {
+			if strings.HasPrefix(dir.Name(), ".") {
+				continue // Exclude hidden dirs
 			}
-			s3Buckets = append(s3Buckets, Bucket{Name: dir.Name(), CreationDate: creationDate})
+
+			// Use os.Stat to follow symlinks and check if it's a directory
+			fullPath := filepath.Join(serverConfig.DataDir, dir.Name())
+			info, err := os.Stat(fullPath)
+			if err != nil {
+				log.Printf("Warning: Could not stat %s: %v", fullPath, err)
+				continue
+			}
+			if !info.IsDir() {
+				continue
+			}
+
+			// Skip if already defined as a custom bucket (custom takes precedence)
+			if _, exists := serverConfig.Buckets[dir.Name()]; exists {
+				continue
+			}
+
+			creationDate := info.ModTime().UTC().Format("2006-01-02T15:04:05.000Z")
+			bucketSet[dir.Name()] = Bucket{Name: dir.Name(), CreationDate: creationDate}
 		}
 	}
+
+	// Convert map to sorted slice
+	var s3Buckets []Bucket
+	for _, bucket := range bucketSet {
+		s3Buckets = append(s3Buckets, bucket)
+	}
+	sort.Slice(s3Buckets, func(i, j int) bool {
+		return s3Buckets[i].Name < s3Buckets[j].Name
+	})
 
 	result := ListAllMyBucketsResult{
 		Owner:   Owner{ID: "minis3-user-id", DisplayName: "minis3-user"}, // Placeholder owner
@@ -422,7 +537,14 @@ func createBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 		return
 	}
 
-	bucketPath := filepath.Join(dataDir, bucketName)
+	// Check if this is a custom-configured bucket (can't create via API)
+	if _, isCustom := serverConfig.Buckets[bucketName]; isCustom {
+		log.Printf("Bucket %s is a custom-configured bucket, already exists.", bucketName)
+		w.WriteHeader(http.StatusOK) // Idempotent
+		return
+	}
+
+	bucketPath := getBucketPath(bucketName)
 	metadataPath := filepath.Join(bucketPath, ".metadata")
 
 	// Check if bucket already exists
@@ -455,7 +577,16 @@ func createBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	w.WriteHeader(http.StatusOK)
 }
 func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	// Prevent deletion of custom-configured buckets via API
+	if _, isCustom := serverConfig.Buckets[bucketName]; isCustom {
+		log.Printf("Cannot delete custom-configured bucket %s via API", bucketName)
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusForbidden)
+		w.Write([]byte(errorToXML("AccessDenied", "Cannot delete custom-configured bucket via API.")))
+		return
+	}
+
+	bucketPath := getBucketPath(bucketName)
 	metadataPath := filepath.Join(bucketPath, ".metadata")
 
 	// Check if bucket exists
@@ -509,7 +640,7 @@ func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	w.WriteHeader(http.StatusNoContent)
 }
 func getBucketLocationHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
 		log.Printf("Bucket %s does not exist for GetBucketLocation", bucketName)
@@ -537,7 +668,7 @@ func getBucketLocationHandler(w http.ResponseWriter, r *http.Request, bucketName
 }
 
 func headBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 
 	// Check if bucket exists
 	if _, err := os.Stat(bucketPath); os.IsNotExist(err) {
@@ -551,7 +682,7 @@ func headBucketHandler(w http.ResponseWriter, r *http.Request, bucketName string
 }
 
 func putObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	// Object data is stored directly in the bucket directory
 	objectDataPath := filepath.Join(bucketPath, objectName)
 	// Metadata is stored in .metadata subdirectory
@@ -678,7 +809,7 @@ func putObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 }
 
 func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	objectMetadataPath := filepath.Join(bucketPath, ".metadata", objectName+".meta")
 
 	// Check if bucket exists
@@ -756,7 +887,7 @@ func getObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, object
 }
 
 func deleteObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	objectMetadataPath := filepath.Join(bucketPath, ".metadata", objectName+".meta")
 	objectDataPath := filepath.Join(bucketPath, objectName)
 
@@ -821,7 +952,7 @@ func deleteObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, obj
 }
 
 func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	objectMetadataPath := filepath.Join(bucketPath, ".metadata", objectName+".meta")
 
 	// Check if bucket exists
@@ -875,7 +1006,7 @@ func headObjectHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 
 // listObjectsV2Handler implementation
 func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	metadataDir := filepath.Join(bucketPath, ".metadata")
 
 	// Check if bucket exists
@@ -1068,7 +1199,7 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 
 // Multipart Handlers
 func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 
 	// Validate object key
 	if err := validateObjectKey(objectName); err != nil {
@@ -1148,7 +1279,7 @@ func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 }
 
 func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName, partNumberStr, uploadID string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	mpUploadMetaPath := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+".json")
 
 	partNumber, err := parseInt(partNumberStr, "partNumber")
@@ -1264,7 +1395,7 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 }
 
 func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName, uploadID string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	mpUploadMetaPath := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+".json")
 	partsDir := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+"_parts")
 
@@ -1472,7 +1603,7 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 }
 
 func abortMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketName, objectName, uploadID string) {
-	bucketPath := filepath.Join(dataDir, bucketName)
+	bucketPath := getBucketPath(bucketName)
 	mpUploadMetaPath := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+".json")
 	partsDir := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+"_parts")
 

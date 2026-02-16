@@ -2,6 +2,21 @@
 
 This project implements a minimalist S3-compatible server in Go. It supports basic bucket and object operations, including multipart uploads, and uses AWS Signature Version 4 for authentication.
 
+## Why mini-s3?
+
+**Serve any directory as an S3 bucket.** Unlike other S3-compatible servers that manage their own opaque storage, mini-s3 maps buckets directly to filesystem directories. This means you can:
+
+- Point a bucket at an existing directory and immediately access its contents via S3 API
+- Use symlinks to expose directories from anywhere on your system
+- Mount network shares, NFS volumes, or any filesystem and serve them as S3 buckets
+- Mix auto-discovered buckets with explicitly configured custom paths
+
+This makes mini-s3 ideal for:
+- Exposing existing file archives via S3-compatible APIs
+- Creating S3 gateways to legacy storage systems
+- Development and testing against real directory structures
+- Serving static content from arbitrary locations
+
 ## Features
 
 *   **Bucket Operations**:
@@ -23,7 +38,7 @@ This project implements a minimalist S3-compatible server in Go. It supports bas
     *   Complete (`POST /<bucket>/<object>?uploadId=XYZ`)
     *   Abort (`DELETE /<bucket>/<object>?uploadId=XYZ`)
 *   **Authentication**: AWS Signature Version 4 (HMAC-SHA256).
-*   **Storage**: Uses the local filesystem. Object data is stored directly, and metadata is stored in a hidden `.metadata` subdirectory within each bucket.
+*   **Flexible Storage**: Maps buckets directly to filesystem directories. Auto-discovers buckets from a configurable root directory, plus supports explicit bucket-to-path mappings for serving arbitrary directories. Follows symlinks.
 *   **HTTPS**: Enforces HTTPS-only access.
 *   **ACLs**: Stubbed (returns "Not Implemented").
 
@@ -94,7 +109,74 @@ AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin \
   aws s3 ls --endpoint-url https://localhost:8443 --no-verify-ssl --region us-east-1
 ```
 
-## Setup and Configuration
+## Configuration File
+
+mini-s3 uses a JSON configuration file to define storage locations. By default, it looks for `config.json` in the current directory.
+
+### Configuration Options
+
+Create a `config.json` file (see `config.json.example`):
+
+```json
+{
+  "dataDir": "./data/",
+  "buckets": {
+    "photos": "/mnt/storage/photos",
+    "backups": "/var/backups/s3-mirror",
+    "home": "/home/username"
+  }
+}
+```
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `dataDir` | Root directory for auto-discovered buckets. Any subdirectory (including symlinks) becomes a bucket. | `./data/` |
+| `buckets` | Map of bucket names to custom filesystem paths. These buckets can point anywhere on the system. | `{}` |
+
+### How Bucket Discovery Works
+
+1. **Custom buckets** (from `config.json` `buckets` map) are loaded first
+2. **Auto-discovered buckets** are found by scanning `dataDir` for subdirectories
+3. Symlinks are followed - a symlink to a directory is treated as a valid bucket
+4. Custom buckets take precedence if there's a name collision
+
+### Custom Bucket Behavior
+
+Buckets defined in `config.json`:
+- Appear in `ListBuckets` alongside auto-discovered buckets
+- **Cannot be deleted** via the S3 API (protected)
+- **Cannot be created** via the S3 API (already exist)
+- Can point to any readable directory on the filesystem
+
+### Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MINIS3_CONFIG` | Path to configuration file | `config.json` |
+| `MINIS3_ACCESS_KEY` | Access Key ID for authentication | `minioadmin` |
+| `MINIS3_SECRET_KEY` | Secret Access Key for authentication | `minioadmin` |
+
+### Example: Serving Existing Directories
+
+To expose `/var/log` as an S3 bucket named `logs` and `/home/user/documents` as `docs`:
+
+```json
+{
+  "dataDir": "./data/",
+  "buckets": {
+    "logs": "/var/log",
+    "docs": "/home/user/documents"
+  }
+}
+```
+
+Then access via S3:
+```bash
+aws s3 ls s3://logs/ --profile minis3 --endpoint-url https://localhost:8443 --no-verify-ssl
+aws s3 cp s3://docs/report.pdf ./report.pdf --profile minis3 --endpoint-url https://localhost:8443 --no-verify-ssl
+```
+
+## Setup and Installation
 
 1.  **Clone the Repository**:
     ```bash
@@ -182,13 +264,18 @@ aws s3 cp s3://mytestbucket/test.txt downloaded_test.txt --profile minis3 --endp
 
 ```
 .
-├── main.go         # Main application code
-├── Makefile        # Makefile for building, running, etc.
-├── README.md       # This file
-├── certs/          # Directory for SSL certificates
-│   ├── cert.pem    # SSL certificate
-│   └── key.pem     # SSL private key
-└── data/           # Root directory for storing buckets and objects (created on run)
+├── main.go              # Main application code
+├── Makefile             # Makefile for building, running, etc.
+├── README.md            # This file
+├── config.json          # Server configuration (optional, see config.json.example)
+├── config.json.example  # Example configuration file
+├── certs/               # Directory for SSL certificates
+│   ├── cert.pem         # SSL certificate
+│   └── key.pem          # SSL private key
+└── data/                # Default root for auto-discovered buckets
+    └── <bucket>/        # Each subdirectory is a bucket
+        ├── <objects>    # Object data files
+        └── .metadata/   # Object metadata (JSON files)
 ```
 
 ## Testing

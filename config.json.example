@@ -1,0 +1,8 @@
+{
+  "dataDir": "./data/",
+  "buckets": {
+    "photos": "/mnt/storage/photos",
+    "backups": "/var/backups/s3-mirror",
+    "shared": "/home/user/shared-folder"
+  }
+}
