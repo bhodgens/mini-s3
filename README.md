@@ -40,6 +40,7 @@ This makes mini-s3 ideal for:
 *   **Authentication**: AWS Signature Version 4 (HMAC-SHA256).
 *   **Flexible Storage**: Maps buckets directly to filesystem directories. Auto-discovers buckets from a configurable root directory, plus supports explicit bucket-to-path mappings for serving arbitrary directories. Follows symlinks.
 *   **HTTPS**: Enforces HTTPS-only access.
+*   **Event Actions**: Execute shell commands in response to S3 operations (upload, download, delete). Supports pattern matching, async execution, timeouts, and inactivity triggers. Configure via `.bucket-actions` files.
 *   **ACLs**: Stubbed (returns "Not Implemented").
 
 ## Prerequisites
