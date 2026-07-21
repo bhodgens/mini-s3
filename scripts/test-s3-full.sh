@@ -265,8 +265,116 @@ EBUCKET
             kill "$SERVER_PID" 2>/dev/null || true
             exit 1
         fi
+
+        # Pre-populate bucket with objects directly on disk to test read path
+        info "Pre-populating bucket with disk-level objects..."
+        local bucket_dir="$TEST_DIR/data/$BUCKET"
+        local meta_dir="$bucket_dir/.metadata"
+
+        # Pre-existing flat file
+        local pre_content="This object was written directly to disk before the server started."
+        local pre_path="$bucket_dir/pre-existing.txt"
+        local pre_meta="$meta_dir/pre-existing.txt.meta"
+        mkdir -p "$(dirname "$pre_meta")"
+        echo "$pre_content" > "$pre_path"
+        local pre_md5
+        pre_md5=$(md5 -q "$pre_path" 2>/dev/null || md5sum "$pre_path" | cut -d' ' -f1)
+        local pre_size
+        pre_size=$(wc -c < "$pre_path" | tr -d ' ')
+        cat > "$pre_meta" <<PREEOF
+{
+  "contentType": "text/plain",
+  "contentLength": $pre_size,
+  "eTag": "$pre_md5",
+  "customMetadata": {"x-amz-meta-source": "disk-populated"},
+  "lastModified": "$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")",
+  "storagePath": "$pre_path"
+}
+PREEOF
+
+        # Pre-existing nested binary file
+        local pre_nested_path="$bucket_dir/pre-existing/nested/data.bin"
+        local pre_nested_meta="$meta_dir/pre-existing/nested/data.bin.meta"
+        mkdir -p "$(dirname "$pre_nested_path")" "$(dirname "$pre_nested_meta")"
+        dd if=/dev/urandom of="$pre_nested_path" bs=1024 count=4 2>/dev/null
+        local pre_nested_md5
+        pre_nested_md5=$(md5 -q "$pre_nested_path" 2>/dev/null || md5sum "$pre_nested_path" | cut -d' ' -f1)
+        local pre_nested_size
+        pre_nested_size=$(wc -c < "$pre_nested_path" | tr -d ' ')
+        cat > "$pre_nested_meta" <<PREEOF
+{
+  "contentType": "application/octet-stream",
+  "contentLength": $pre_nested_size,
+  "eTag": "$pre_nested_md5",
+  "customMetadata": {},
+  "lastModified": "$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")",
+  "storagePath": "$pre_nested_path"
+}
+PREEOF
+        info "Pre-populated 2 objects on disk"
     else
         info "Using already-running server at $ENDPOINT"
+    fi
+}
+
+# ---- Pre-existing Objects (Read Path) ----
+test_pre_existing_objects() {
+    header "Pre-existing Objects (Read Path)"
+
+    # List objects — pre-existing ones should appear
+    assert_contains "ListBuckets includes pre-existing objects" \
+        "run_s3 ls --recursive 's3://$BUCKET/'" "pre-existing.txt"
+
+    assert_contains "ListBuckets includes pre-existing nested object" \
+        "run_s3 ls --recursive 's3://$BUCKET/'" "pre-existing/nested/data.bin"
+
+    # Head pre-existing object
+    local head_out
+    head_out=$(run_s3api head-object --bucket "$BUCKET" --key "pre-existing.txt" 2>&1) || true
+    if echo "$head_out" | grep -q "ContentLength"; then
+        pass "Head pre-existing flat object"
+    else
+        fail "Head pre-existing flat object" "No ContentLength in response"
+    fi
+
+    # Head pre-existing nested object
+    head_out=$(run_s3api head-object --bucket "$BUCKET" --key "pre-existing/nested/data.bin" 2>&1) || true
+    if echo "$head_out" | grep -q "ContentLength"; then
+        pass "Head pre-existing nested object"
+    else
+        fail "Head pre-existing nested object" "No ContentLength in response"
+    fi
+
+    # Download pre-existing flat file and verify content
+    run_test "Download pre-existing flat file" \
+        run_s3 cp "s3://$BUCKET/pre-existing.txt" "$TEST_DIR/verify-pre-existing.txt"
+
+    local expected_content="This object was written directly to disk before the server started."
+    if [[ "$(cat "$TEST_DIR/verify-pre-existing.txt")" == "$expected_content" ]]; then
+        pass "Pre-existing flat content matches"
+    else
+        fail "Pre-existing flat content matches" "Content mismatch"
+    fi
+
+    # Download pre-existing nested binary and verify size
+    run_test "Download pre-existing nested binary" \
+        run_s3 cp "s3://$BUCKET/pre-existing/nested/data.bin" "$TEST_DIR/verify-pre-existing.bin"
+
+    local expected_size=4096  # 4 * 1024
+    local actual_size
+    actual_size=$(wc -c < "$TEST_DIR/verify-pre-existing.bin" | tr -d ' ')
+    if [[ "$actual_size" -eq "$expected_size" ]]; then
+        pass "Pre-existing nested binary size matches"
+    else
+        fail "Pre-existing nested binary size matches" "Expected $expected_size bytes, got $actual_size"
+    fi
+
+    # Verify custom metadata from pre-existing object (x-amz-meta-source)
+    head_out=$(run_s3api head-object --bucket "$BUCKET" --key "pre-existing.txt" 2>&1) || true
+    if echo "$head_out" | grep -q "disk-populated"; then
+        pass "Pre-existing custom metadata preserved"
+    else
+        fail "Pre-existing custom metadata preserved" "Missing x-amz-meta-source"
     fi
 }
 
@@ -617,6 +725,7 @@ print_results() {
 main() {
     setup
 
+    test_pre_existing_objects
     test_bucket_ops
     test_object_ops
     test_listing
