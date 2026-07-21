@@ -1,13 +1,12 @@
 BINARY_NAME=mini-s3-server
-GO_FILES=main.go
 
-.PHONY: all build run clean certs
+.PHONY: all build run clean certs test test-cover
 
 all: build
 
 build:
 	@echo "Building $(BINARY_NAME)..."
-	@go build -o $(BINARY_NAME) $(GO_FILES)
+	@go build -o $(BINARY_NAME) .
 	@echo "$(BINARY_NAME) built successfully."
 
 run: build
@@ -18,6 +17,15 @@ clean:
 	@echo "Cleaning up..."
 	@rm -f $(BINARY_NAME)
 	@echo "Cleanup complete."
+
+test:
+	@go test -v -count=1 -coverprofile=coverage.out ./...
+	@go tool cover -func=coverage.out | tail -1
+
+test-cover:
+	@go test -v -count=1 -coverprofile=coverage.out ./...
+	@go tool cover -html=coverage.out -o coverage.html
+	@echo "Coverage report: coverage.html"
 
 certs:
 	@if [ ! -f certs/cert.pem ] || [ ! -f certs/key.pem ]; then \

@@ -1,1 +1,5 @@
 mini-s3-server
+coverage.out
+coverage.html
+certs/
+data/
