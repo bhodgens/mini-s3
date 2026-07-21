@@ -20,6 +20,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -103,6 +104,15 @@ var serverCredentials = struct {
 }{
 	AccessKeyID:     getEnvOrDefault("MINIS3_ACCESS_KEY", "minioadmin"),
 	SecretAccessKey: getEnvOrDefault("MINIS3_SECRET_KEY", "minioadmin"),
+}
+
+// multipartLocks protects concurrent read-modify-write operations on multipart upload metadata
+var multipartLocks sync.Map // map[string]*sync.Mutex — keyed by upload metadata file path
+
+// getMultipartLock returns the mutex for a given upload metadata path, creating one if needed
+func getMultipartLock(path string) *sync.Mutex {
+	mu, _ := multipartLocks.LoadOrStore(path, &sync.Mutex{})
+	return mu.(*sync.Mutex)
 }
 
 func getEnvOrDefault(key, defaultValue string) string {
@@ -407,9 +417,10 @@ type LocationConstraint struct {
 
 // MultipartUpload represents an active multipart upload session
 type MultipartUpload struct {
-	UploadID  string    `json:"uploadId"`
-	Key       string    `json:"key"`
-	Initiated time.Time `json:"initiated"`
+	UploadID       string            `json:"uploadId"`
+	Key            string            `json:"key"`
+	Initiated      time.Time         `json:"initiated"`
+	CustomMetadata map[string]string `json:"customMetadata,omitempty"` // x-amz-meta-* headers from initiate
 	// Parts will store metadata about each uploaded part
 	Parts map[int]PartMetadata `json:"parts"` // Keyed by PartNumber
 }
@@ -475,7 +486,7 @@ func listBucketsHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Error reading data directory %s: %v", serverConfig.DataDir, err)
 		// Don't fail if we have custom buckets
 		if len(bucketSet) == 0 {
-			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+			writeS3Error(w, "InternalError", "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
 	} else {
@@ -522,7 +533,7 @@ func listBucketsHandler(w http.ResponseWriter, r *http.Request) {
 	x, err := xml.MarshalIndent(result, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling ListAllMyBucketsResult to XML: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		writeS3Error(w, "InternalError", "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
@@ -559,7 +570,7 @@ func createBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	}
 
 	// Create bucket directory
-	if err := os.Mkdir(bucketPath, 0755); err != nil {
+	if err := os.MkdirAll(bucketPath, 0755); err != nil {
 		log.Printf("Error creating bucket directory %s: %v", bucketPath, err)
 		w.Header().Set("Content-Type", "application/xml")
 		w.WriteHeader(http.StatusInternalServerError)
@@ -613,7 +624,7 @@ func deleteBucketHandler(w http.ResponseWriter, r *http.Request, bucketName stri
 	}
 
 	for _, file := range files {
-		if file.Name() != ".metadata" {
+		if file.Name() != ".metadata" && file.Name() != ".bucket-actions" {
 			log.Printf("Attempted to delete non-empty bucket: %s", bucketName)
 			w.Header().Set("Content-Type", "application/xml")
 			w.WriteHeader(http.StatusConflict)
@@ -1063,16 +1074,15 @@ func listObjectsV2Handler(w http.ResponseWriter, r *http.Request, bucketName str
 	maxKeysStr := r.URL.Query().Get("max-keys")
 	maxKeys := 1000 // Default S3 maxKeys
 	if maxKeysStr != "" {
-		var tempMaxKeys int
-		if n, err := fmt.Sscan(maxKeysStr, &tempMaxKeys); err != nil || n != 1 {
+		if n, err := strconv.Atoi(maxKeysStr); err != nil {
 			log.Printf("Invalid max-keys value: '%s'. Using default %d.", maxKeysStr, 1000)
 		} else {
-			if tempMaxKeys < 0 {
-				log.Printf("max-keys must be non-negative. Received %d. Using default %d.", tempMaxKeys, 1000)
-			} else if tempMaxKeys > 1000 {
+			if n < 0 {
+				log.Printf("max-keys must be non-negative. Received %d. Using default %d.", n, 1000)
+			} else if n > 1000 {
 				maxKeys = 1000 // S3 caps at 1000
 			} else {
-				maxKeys = tempMaxKeys
+				maxKeys = n
 			}
 		}
 	}
@@ -1271,10 +1281,18 @@ func initiateMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	mpUpload := MultipartUpload{
-		UploadID:  uploadID,
-		Key:       objectName,
-		Initiated: time.Now().UTC(),
-		Parts:     make(map[int]PartMetadata),
+		UploadID:       uploadID,
+		Key:            objectName,
+		Initiated:      time.Now().UTC(),
+		CustomMetadata: make(map[string]string),
+		Parts:          make(map[int]PartMetadata),
+	}
+
+	// Capture x-amz-meta-* custom headers for propagation to final object
+	for headerName, headerValues := range r.Header {
+		if strings.HasPrefix(strings.ToLower(headerName), "x-amz-meta-") {
+			mpUpload.CustomMetadata[headerName] = strings.Join(headerValues, ", ")
+		}
 	}
 	mpUploadJSON, err := json.MarshalIndent(mpUpload, "", "  ")
 	if err != nil {
@@ -1333,6 +1351,11 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 		return
 	}
 
+	// Acquire lock to prevent race conditions with concurrent part uploads to the same upload
+	uploadLock := getMultipartLock(mpUploadMetaPath)
+	uploadLock.Lock()
+	defer uploadLock.Unlock()
+
 	// Read multipart upload metadata
 	metaJSON, err := os.ReadFile(mpUploadMetaPath)
 	if os.IsNotExist(err) {
@@ -1377,6 +1400,21 @@ func uploadPartHandler(w http.ResponseWriter, r *http.Request, bucketName, objec
 		return
 	}
 	defer r.Body.Close()
+
+	// Handle aws-chunked Content-Encoding (used by AWS CLI v2)
+	contentEncoding := r.Header.Get("Content-Encoding")
+	if strings.Contains(contentEncoding, "aws-chunked") {
+		decodedBody, err := decodeAWSChunked(body)
+		if err != nil {
+			log.Printf("Error decoding aws-chunked body for part %d of %s/%s: %v", partNumber, bucketName, objectName, err)
+			w.Header().Set("Content-Type", "application/xml")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(errorToXML("InvalidArgument", "Failed to decode chunked part body.")))
+			return
+		}
+		body = decodedBody
+		log.Printf("Decoded aws-chunked part body: %d bytes", len(body))
+	}
 
 	partSize := int64(len(body))
 
@@ -1435,6 +1473,11 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	bucketPath := getBucketPath(bucketName)
 	mpUploadMetaPath := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+".json")
 	partsDir := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+"_parts")
+
+	// Acquire lock to prevent race with concurrent uploadPartHandler calls
+	uploadLock := getMultipartLock(mpUploadMetaPath)
+	uploadLock.Lock()
+	defer uploadLock.Unlock()
 
 	// Read multipart upload metadata
 	metaJSON, err := os.ReadFile(mpUploadMetaPath)
@@ -1589,7 +1632,7 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 		ContentType:    r.Header.Get("Content-Type"),
 		ContentLength:  totalSize,
 		ETag:           strings.Trim(finalETag, "\""),
-		CustomMetadata: make(map[string]string),
+		CustomMetadata: mpUpload.CustomMetadata,
 		LastModified:   time.Now().UTC(),
 		StoragePath:    finalObjectPath, // Points to actual object data
 	}
@@ -1621,7 +1664,7 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	}
 
 	result := CompletedMultipartUploadResult{
-		Location: r.Host + r.URL.Path, // Construct object URL
+		Location: "https://" + r.Host + r.URL.Path, // Construct full object URL
 		Bucket:   bucketName,
 		Key:      objectName,
 		ETag:     finalETag,
@@ -1629,7 +1672,7 @@ func completeMultipartUploadHandler(w http.ResponseWriter, r *http.Request, buck
 	x, err := xml.MarshalIndent(result, "", "  ")
 	if err != nil {
 		log.Printf("Error marshalling CompletedMultipartUploadResult to XML: %v", err)
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		writeS3Error(w, "InternalError", "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 
@@ -1655,6 +1698,11 @@ func abortMultipartUploadHandler(w http.ResponseWriter, r *http.Request, bucketN
 	bucketPath := getBucketPath(bucketName)
 	mpUploadMetaPath := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+".json")
 	partsDir := filepath.Join(bucketPath, ".metadata", ".uploads", uploadID+"_parts")
+
+	// Acquire lock to prevent race with concurrent part uploads
+	uploadLock := getMultipartLock(mpUploadMetaPath)
+	uploadLock.Lock()
+	defer uploadLock.Unlock()
 
 	// Check if the multipart upload metadata file exists
 	_, err := os.Stat(mpUploadMetaPath)
@@ -1856,32 +1904,32 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 		requestTimestamp, err = time.Parse(http.TimeFormat, dateHeader)
 	} else {
 		log.Println("Authentication Error: Missing x-amz-date or Date header.")
-		http.Error(w, errorToXML("AccessDenied", "AWS authentication requires a valid Date or x-amz-date header"), http.StatusForbidden)
+		writeS3Error(w, "AccessDenied", "AWS authentication requires a valid Date or x-amz-date header", http.StatusForbidden)
 		return false
 	}
 	if err != nil {
 		log.Printf("Authentication Error: Invalid date format. x-amz-date: '%s', Date: '%s'. Error: %v", xAmzDate, dateHeader, err)
-		http.Error(w, errorToXML("InvalidDate", "The date provided is invalid."), http.StatusBadRequest)
+		writeS3Error(w, "InvalidDate", "The date provided is invalid.", http.StatusBadRequest)
 		return false
 	}
 
 	if time.Since(requestTimestamp).Abs() > 15*time.Minute {
 		log.Printf("Authentication Error: Request timestamp %s is too skewed from server time %s.", requestTimestamp.Format(iso8601Format), time.Now().UTC().Format(iso8601Format))
-		http.Error(w, errorToXML("RequestTimeTooSkewed", "The difference between the request time and the current time is too large."), http.StatusForbidden)
+		writeS3Error(w, "RequestTimeTooSkewed", "The difference between the request time and the current time is too large.", http.StatusForbidden)
 		return false
 	}
 
 	if authHeader == "" {
 		// Enforce auth for all requests now. Remove temporary allowance for ListBuckets if any.
 		log.Println("Authentication Error: Missing Authorization header.")
-		http.Error(w, errorToXML("AuthorizationHeaderMissing", "The authorization header is missing."), http.StatusForbidden)
+		writeS3Error(w, "AuthorizationHeaderMissing", "The authorization header is missing.", http.StatusForbidden)
 		return false
 	}
 
 	matches := authHeaderRegex.FindStringSubmatch(authHeader)
 	if len(matches) != 6 {
 		log.Printf("Authentication Error: Invalid Authorization header format: %s", authHeader)
-		http.Error(w, errorToXML("AuthorizationHeaderMalformed", "The authorization header is malformed; it does not match the expected format."), http.StatusBadRequest)
+		writeS3Error(w, "AuthorizationHeaderMalformed", "The authorization header is malformed; it does not match the expected format.", http.StatusBadRequest)
 		return false
 	}
 
@@ -1893,7 +1941,7 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 
 	if accessKeyID != serverCredentials.AccessKeyID {
 		log.Printf("Authentication Error: Unknown AccessKeyID: %s", accessKeyID)
-		http.Error(w, errorToXML("InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records."), http.StatusForbidden)
+		writeS3Error(w, "InvalidAccessKeyId", "The AWS Access Key Id you provided does not exist in our records.", http.StatusForbidden)
 		return false
 	}
 
@@ -1901,13 +1949,13 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 	requestDateStamp := requestTimestamp.UTC().Format(shortDateFormat)
 	if dateStampFromCred != requestDateStamp {
 		log.Printf("Authentication Error: Date mismatch. Credential scope date: %s, Request date: %s", dateStampFromCred, requestDateStamp)
-		http.Error(w, errorToXML("SignatureDoesNotMatch", "Credential scope date mismatch."), http.StatusForbidden)
+		writeS3Error(w, "SignatureDoesNotMatch", "Credential scope date mismatch.", http.StatusForbidden)
 		return false
 	}
 
 	if regionFromCred != defaultRegion {
 		log.Printf("Authentication Error: Invalid region. Expected %s, got %s", defaultRegion, regionFromCred)
-		http.Error(w, errorToXML("AuthorizationHeaderMalformed", "Region in credential scope ('"+regionFromCred+"') is incorrect; expected '"+defaultRegion+"'."), http.StatusForbidden)
+		writeS3Error(w, "AuthorizationHeaderMalformed", "Region in credential scope ('"+regionFromCred+"') is incorrect; expected '"+defaultRegion+"'.", http.StatusForbidden)
 		return false
 	}
 
@@ -1915,7 +1963,7 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 	payloadHash, _, err := getPayloadHash(r) // bodyBytes might be needed if we re-calculate hash for some reason
 	if err != nil {
 		log.Printf("Authentication Error: Failed to get/verify payload hash: %v", err)
-		http.Error(w, errorToXML("SignatureDoesNotMatch", "Payload hash mismatch or error reading body."), http.StatusForbidden)
+		writeS3Error(w, "SignatureDoesNotMatch", "Payload hash mismatch or error reading body.", http.StatusForbidden)
 		return false
 	}
 
@@ -1963,7 +2011,7 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 	if serverSignature != clientSignature {
 		log.Printf("Authentication Error: Signature mismatch.\nServer Signature: %s\nClient Signature: %s\nString To Sign:\n%s\nCanonical Request:\n%s",
 			serverSignature, clientSignature, stringToSign, canonicalRequest)
-		http.Error(w, errorToXML("SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided."), http.StatusForbidden)
+		writeS3Error(w, "SignatureDoesNotMatch", "The request signature we calculated does not match the signature you provided.", http.StatusForbidden)
 		return false
 	}
 
@@ -1974,18 +2022,24 @@ func authenticateRequest(w http.ResponseWriter, r *http.Request) bool {
 // Placeholder ACL related requests.
 func handleACL(w http.ResponseWriter, r *http.Request, bucketName, objectName string) {
 	log.Printf("ACL request for Bucket: '%s', Object: '%s' - Not Implemented", bucketName, objectName)
-	http.Error(w, "ACLs are not implemented.", http.StatusNotImplemented)
+	writeS3Error(w, "NotImplemented", "ACLs are not implemented.", http.StatusNotImplemented)
 }
 
-// Helper function to parse integers from string query parameters
+// parseInt converts a string to an integer, rejecting partial parses like "5a"
 func parseInt(valueStr string, paramName string) (int, error) {
-	var val int
-	_, err := fmt.Sscan(valueStr, &val)
+	val, err := strconv.Atoi(valueStr)
 	if err != nil {
 		log.Printf("Invalid %s value: %s", paramName, valueStr)
 		return 0, err
 	}
 	return val, nil
+}
+
+// writeS3Error writes an S3-compliant XML error response with proper Content-Type header
+func writeS3Error(w http.ResponseWriter, code string, message string, statusCode int) {
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(statusCode)
+	w.Write([]byte(errorToXML(code, message)))
 }
 
 // validateBucketName validates S3 bucket naming rules
