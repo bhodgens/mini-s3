@@ -533,10 +533,13 @@ func matchesAnyPattern(objectKey string, patterns []string) bool {
 func matchPathGlob(path, pattern string) bool {
 	// Handle ** for recursive matching
 	if strings.Contains(pattern, "**") {
-		// Convert ** to regex
+		// Escape regex meta chars, then convert glob to regex
 		regexPattern := strings.ReplaceAll(pattern, ".", "\\.")
-		regexPattern = strings.ReplaceAll(regexPattern, "**", ".*")
+		// Replace ** with placeholder first to avoid double-processing *
+		const placeholder = "\x00"
+		regexPattern = strings.ReplaceAll(regexPattern, "**", placeholder)
 		regexPattern = strings.ReplaceAll(regexPattern, "*", "[^/]*")
+		regexPattern = strings.ReplaceAll(regexPattern, placeholder, ".*")
 		regexPattern = "^" + regexPattern + "$"
 
 		matched, err := regexp.MatchString(regexPattern, path)
